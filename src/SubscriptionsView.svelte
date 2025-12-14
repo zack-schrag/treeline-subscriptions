@@ -30,7 +30,6 @@
   let hiddenMerchants = $state<Set<string>>(new Set());
   let isLoading = $state(true);
   let showHidden = $state(false);
-  let theme = $state<"light" | "dark">("light");
   let sortBy = $state<"annual_cost" | "merchant" | "last_charge">("annual_cost");
   let sortDesc = $state(true);
 
@@ -67,11 +66,6 @@
   let unsubscribe: (() => void) | null = null;
 
   onMount(async () => {
-    theme = sdk.theme.current();
-    sdk.theme.subscribe((t: string) => {
-      theme = t as "light" | "dark";
-    });
-
     unsubscribe = sdk.onDataRefresh(() => {
       detectSubscriptions();
     });
@@ -264,7 +258,7 @@
   }
 </script>
 
-<div class="container" class:dark={theme === "dark"}>
+<div class="container">
   <header>
     <div class="header-left">
       <h1>Subscriptions</h1>
@@ -353,96 +347,81 @@
 </div>
 
 <style>
+  /* Use CSS variables from host app - no dark mode classes needed */
   .container {
-    padding: 24px;
+    padding: var(--spacing-lg, 24px);
     font-family: system-ui, -apple-system, sans-serif;
-    color: #1a1a1a;
-    background: #ffffff;
+    color: var(--text-primary);
+    background: var(--bg-primary);
     min-height: 100%;
-  }
-
-  .container.dark {
-    color: #e5e5e5;
-    background: #1a1a1a;
   }
 
   header {
     display: flex;
     justify-content: space-between;
     align-items: flex-start;
-    margin-bottom: 24px;
+    margin-bottom: var(--spacing-lg, 24px);
   }
 
   .header-right {
     display: flex;
     align-items: center;
-    gap: 16px;
+    gap: var(--spacing-md, 16px);
   }
 
   h1 {
-    font-size: 24px;
+    font-size: 20px;
     font-weight: 600;
     margin: 0;
+    color: var(--text-primary);
   }
 
   .subtitle {
-    color: #666;
+    color: var(--text-muted);
     margin: 4px 0 0;
-    font-size: 14px;
-  }
-
-  .dark .subtitle {
-    color: #888;
+    font-size: 13px;
   }
 
   .toggle {
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: var(--spacing-sm, 8px);
     font-size: 13px;
-    color: #666;
+    color: var(--text-secondary);
     cursor: pointer;
   }
 
-  .dark .toggle {
-    color: #888;
+  .toggle input {
+    accent-color: var(--accent-primary);
   }
 
   .btn {
-    padding: 8px 16px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 14px;
     border-radius: 6px;
     font-size: 13px;
     font-weight: 500;
     cursor: pointer;
     border: none;
+    transition: all 0.15s;
   }
 
   .btn.secondary {
-    background: #e5e7eb;
-    color: #374151;
-  }
-
-  .dark .btn.secondary {
-    background: #3a3a3a;
-    color: #e5e5e5;
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+    border: 1px solid var(--border-primary);
   }
 
   .btn.secondary:hover {
-    background: #d1d5db;
-  }
-
-  .dark .btn.secondary:hover {
-    background: #4a4a4a;
+    background: var(--bg-secondary);
   }
 
   .loading, .empty {
     text-align: center;
     padding: 48px;
-    color: #666;
-  }
-
-  .dark .loading, .dark .empty {
-    color: #888;
+    color: var(--text-muted);
   }
 
   .hint {
@@ -453,39 +432,32 @@
   .summary-cards {
     display: grid;
     grid-template-columns: repeat(3, 1fr);
-    gap: 16px;
-    margin-bottom: 24px;
+    gap: var(--spacing-md, 16px);
+    margin-bottom: var(--spacing-lg, 24px);
   }
 
   .summary-card {
-    background: #f8f9fa;
-    border: 1px solid #e5e7eb;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-primary);
     border-radius: 8px;
-    padding: 16px;
+    padding: var(--spacing-md, 16px);
     display: flex;
     flex-direction: column;
     gap: 4px;
   }
 
-  .dark .summary-card {
-    background: #2a2a2a;
-    border-color: #3a3a3a;
-  }
-
   .summary-card .label {
-    font-size: 12px;
-    color: #666;
+    font-size: 11px;
+    color: var(--text-muted);
     text-transform: uppercase;
     letter-spacing: 0.5px;
-  }
-
-  .dark .summary-card .label {
-    color: #888;
+    font-weight: 500;
   }
 
   .summary-card .value {
     font-size: 24px;
     font-weight: 600;
+    color: var(--text-primary);
   }
 
   table {
@@ -496,23 +468,15 @@
   th, td {
     padding: 12px;
     text-align: left;
-    border-bottom: 1px solid #e5e7eb;
-  }
-
-  .dark th, .dark td {
-    border-color: #3a3a3a;
+    border-bottom: 1px solid var(--border-primary);
   }
 
   th {
-    font-size: 12px;
+    font-size: 11px;
     font-weight: 600;
-    color: #666;
+    color: var(--text-muted);
     text-transform: uppercase;
     letter-spacing: 0.5px;
-  }
-
-  .dark th {
-    color: #888;
   }
 
   th.sortable {
@@ -520,15 +484,11 @@
   }
 
   th.sortable:hover {
-    color: #3b82f6;
+    color: var(--accent-primary);
   }
 
-  tr:hover {
-    background: #f8f9fa;
-  }
-
-  .dark tr:hover {
-    background: #2a2a2a;
+  tbody tr:hover {
+    background: var(--bg-secondary);
   }
 
   tr.hidden {
@@ -537,45 +497,34 @@
 
   .merchant {
     font-weight: 500;
+    color: var(--text-primary);
   }
 
   .amount, .annual-cost {
-    font-family: ui-monospace, monospace;
+    font-family: var(--font-mono, ui-monospace, monospace);
     font-size: 13px;
   }
 
   .annual-cost {
     font-weight: 600;
-    color: #dc2626;
-  }
-
-  .dark .annual-cost {
-    color: #f87171;
+    color: var(--accent-danger, #ef4444);
   }
 
   .date {
     font-size: 13px;
-    color: #666;
-  }
-
-  .dark .date {
-    color: #888;
+    color: var(--text-muted);
   }
 
   .badge {
     display: inline-block;
-    padding: 2px 8px;
-    background: #e0f2fe;
-    color: #0369a1;
-    font-size: 11px;
-    font-weight: 500;
+    padding: 3px 8px;
+    background: var(--bg-tertiary);
+    color: var(--accent-primary);
+    font-size: 10px;
+    font-weight: 600;
     border-radius: 4px;
     text-transform: uppercase;
-  }
-
-  .dark .badge {
-    background: #1e3a5f;
-    color: #7dd3fc;
+    letter-spacing: 0.3px;
   }
 
   .actions {
@@ -592,13 +541,13 @@
     cursor: pointer;
     border-radius: 4px;
     font-size: 14px;
+    color: var(--text-secondary);
+    display: flex;
+    align-items: center;
+    justify-content: center;
   }
 
   .btn-icon:hover {
-    background: #e5e7eb;
-  }
-
-  .dark .btn-icon:hover {
-    background: #3a3a3a;
+    background: var(--bg-tertiary);
   }
 </style>
