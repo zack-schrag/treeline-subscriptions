@@ -27,6 +27,11 @@
     hidden_at: string;
   }
 
+  interface RecentTransaction {
+    date: string;
+    amount: number;
+  }
+
   // State
   let subscriptions = $state<Subscription[]>([]);
   let hiddenMerchants = $state<Set<string>>(new Set());
@@ -34,6 +39,8 @@
   let showHidden = $state(false);
   let searchQuery = $state("");
   let cursorIndex = $state(0);
+  let recentTransactions = $state<RecentTransaction[]>([]);
+  let isLoadingTransactions = $state(false);
 
   // Refs
   let containerEl = $state<HTMLDivElement | null>(null);
@@ -260,9 +267,35 @@ ORDER BY avg_amount * (365.0 / avg_interval) DESC`;
     }
   }
 
-  function viewTransactions(merchant: string) {
-    sdk.openView("transactions", {
-      initialFilter: `description = '${merchant.replace(/'/g, "''")}'`
+  async function loadRecentTransactions(merchant: string) {
+    isLoadingTransactions = true;
+    try {
+      const escapedMerchant = merchant.replace(/'/g, "''");
+      const rows = await sdk.query<any>(`
+        SELECT transaction_date, amount
+        FROM transactions
+        WHERE description = '${escapedMerchant}'
+        ORDER BY transaction_date DESC
+        LIMIT 15
+      `);
+      recentTransactions = rows.map((row: any) => ({
+        date: row[0] as string,
+        amount: row[1] as number,
+      }));
+    } catch (e) {
+      recentTransactions = [];
+    } finally {
+      isLoadingTransactions = false;
+    }
+  }
+
+  function viewTransactionsInQuery(merchant: string) {
+    const escapedMerchant = merchant.replace(/'/g, "''");
+    sdk.openView("query", {
+      initialQuery: `SELECT transaction_date, description, amount, tags
+FROM transactions
+WHERE description = '${escapedMerchant}'
+ORDER BY transaction_date DESC`
     });
   }
 
@@ -321,7 +354,7 @@ ORDER BY avg_amount * (365.0 / avg_interval) DESC`;
       case "Enter":
         if (sub) {
           e.preventDefault();
-          viewTransactions(sub.merchant);
+          viewTransactionsInQuery(sub.merchant);
         }
         break;
       case "h":
@@ -348,6 +381,15 @@ ORDER BY avg_amount * (365.0 / avg_interval) DESC`;
   $effect(() => {
     if (cursorIndex >= sortedSubscriptions.length) {
       cursorIndex = Math.max(0, sortedSubscriptions.length - 1);
+    }
+  });
+
+  // Load recent transactions when selection changes
+  $effect(() => {
+    if (selectedSubscription) {
+      loadRecentTransactions(selectedSubscription.merchant);
+    } else {
+      recentTransactions = [];
     }
   });
 </script>
@@ -550,10 +592,29 @@ ORDER BY avg_amount * (365.0 / avg_interval) DESC`;
               {/if}
             </div>
 
+            <!-- Recent Transactions Preview -->
+            <div class="sidebar-section">
+              <h3 class="sidebar-title">Recent Charges</h3>
+              {#if isLoadingTransactions}
+                <div class="transactions-loading">Loading...</div>
+              {:else if recentTransactions.length === 0}
+                <div class="transactions-empty">No transactions found</div>
+              {:else}
+                <div class="transactions-list">
+                  {#each recentTransactions as txn}
+                    <div class="transaction-row">
+                      <span class="txn-date">{formatDate(txn.date)}</span>
+                      <span class="txn-amount">{formatCurrency(Math.abs(txn.amount))}</span>
+                    </div>
+                  {/each}
+                </div>
+                <button class="view-all-link" onclick={() => viewTransactionsInQuery(sub.merchant)}>
+                  View all in Query Editor →
+                </button>
+              {/if}
+            </div>
+
             <div class="sidebar-section sidebar-actions">
-              <button class="action-btn primary" onclick={() => viewTransactions(sub.merchant)}>
-                View Transactions
-              </button>
               {#if isHidden}
                 <button class="action-btn" onclick={() => unhideSubscription(sub.merchant)}>
                   Restore
@@ -589,7 +650,7 @@ ORDER BY avg_amount * (365.0 / avg_interval) DESC`;
   <!-- Keyboard Hints -->
   <footer class="keyboard-hints">
     <span class="hint"><kbd>j</kbd><kbd>k</kbd> nav</span>
-    <span class="hint"><kbd>Enter</kbd> view txns</span>
+    <span class="hint"><kbd>Enter</kbd> query</span>
     <span class="hint"><kbd>h</kbd> hide/restore</span>
     <span class="hint"><kbd>/</kbd> search</span>
   </footer>
@@ -1106,6 +1167,61 @@ ORDER BY avg_amount * (365.0 / avg_interval) DESC`;
 
   .stale-warning .warning-icon {
     flex-shrink: 0;
+  }
+
+  /* Recent Transactions Preview */
+  .transactions-loading,
+  .transactions-empty {
+    font-size: 12px;
+    color: var(--text-muted);
+    padding: var(--spacing-sm, 8px) 0;
+  }
+
+  .transactions-list {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    max-height: 200px;
+    overflow-y: auto;
+  }
+
+  .transaction-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 4px 0;
+    font-size: 11px;
+    border-bottom: 1px solid var(--border-primary);
+  }
+
+  .transaction-row:last-child {
+    border-bottom: none;
+  }
+
+  .txn-date {
+    color: var(--text-muted);
+  }
+
+  .txn-amount {
+    font-family: var(--font-mono, monospace);
+    color: var(--text-primary);
+  }
+
+  .view-all-link {
+    display: block;
+    width: 100%;
+    margin-top: var(--spacing-sm, 8px);
+    padding: 6px 0;
+    background: none;
+    border: none;
+    color: var(--accent-primary);
+    font-size: 11px;
+    cursor: pointer;
+    text-align: center;
+  }
+
+  .view-all-link:hover {
+    text-decoration: underline;
   }
 
   .sidebar-actions {
