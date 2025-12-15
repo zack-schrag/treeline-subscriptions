@@ -10,6 +10,7 @@
   // Types
   interface Subscription {
     merchant: string;
+    merchant_key: string; // Normalized key for matching (uppercase, fuzzy-grouped)
     amount: number;
     frequency: string;
     interval_days: number;
@@ -20,11 +21,11 @@
     first_charge: string;
     days_since_last: number;
     is_stale: boolean;
+    is_manual: boolean; // True if added via tag, not auto-detected
   }
 
   interface HiddenSubscription {
-    merchant: string;
-    hidden_at: string;
+    merchant_key: string;
   }
 
   interface RecentTransaction {
@@ -34,13 +35,15 @@
 
   // State
   let subscriptions = $state<Subscription[]>([]);
-  let hiddenMerchants = $state<Set<string>>(new Set());
+  let hiddenMerchantKeys = $state<Set<string>>(new Set());
   let isLoading = $state(true);
   let showHidden = $state(false);
   let searchQuery = $state("");
   let cursorIndex = $state(0);
   let recentTransactions = $state<RecentTransaction[]>([]);
   let isLoadingTransactions = $state(false);
+  let subscriptionTag = $state("subscriptions"); // Default tag for manual subscriptions
+  let showSettings = $state(false);
 
   // Refs
   let containerEl = $state<HTMLDivElement | null>(null);
@@ -49,7 +52,7 @@
   // Computed
   let visibleSubscriptions = $derived(
     subscriptions.filter(s => {
-      const isHidden = hiddenMerchants.has(s.merchant);
+      const isHidden = hiddenMerchantKeys.has(s.merchant_key);
       if (!showHidden && isHidden) return false;
       if (searchQuery) {
         const query = searchQuery.toLowerCase();
@@ -64,18 +67,18 @@
   );
 
   let activeSubscriptions = $derived(
-    subscriptions.filter(s => !hiddenMerchants.has(s.merchant) && !s.is_stale)
+    subscriptions.filter(s => !hiddenMerchantKeys.has(s.merchant_key) && !s.is_stale)
   );
 
   let staleSubscriptions = $derived(
-    subscriptions.filter(s => !hiddenMerchants.has(s.merchant) && s.is_stale)
+    subscriptions.filter(s => !hiddenMerchantKeys.has(s.merchant_key) && s.is_stale)
   );
 
   let activeCount = $derived(activeSubscriptions.length);
 
   let staleCount = $derived(staleSubscriptions.length);
 
-  let hiddenCount = $derived(hiddenMerchants.size);
+  let hiddenCount = $derived(hiddenMerchantKeys.size);
 
   let totalAnnualCost = $derived(
     activeSubscriptions.reduce((sum, s) => sum + s.annual_cost, 0)
@@ -85,7 +88,7 @@
 
   let totalYTDCost = $derived(
     subscriptions
-      .filter(s => !hiddenMerchants.has(s.merchant))
+      .filter(s => !hiddenMerchantKeys.has(s.merchant_key))
       .reduce((sum, s) => sum + s.ytd_cost, 0)
   );
 
@@ -100,6 +103,7 @@
     });
 
     await ensureTable();
+    await loadSettings();
     await loadHiddenMerchants();
     await detectSubscriptions();
 
@@ -114,9 +118,10 @@
   // Database
   async function ensureTable() {
     try {
+      // Create table with merchant_key as primary key
       await sdk.execute(`
         CREATE TABLE IF NOT EXISTS sys_plugin_subscriptions (
-          merchant VARCHAR PRIMARY KEY,
+          merchant_key VARCHAR PRIMARY KEY,
           hidden_at TIMESTAMP
         )
       `);
@@ -125,31 +130,94 @@
     }
   }
 
+  async function loadSettings() {
+    try {
+      const saved = await sdk.settings.get("subscriptionTag");
+      if (saved && typeof saved === "string") {
+        subscriptionTag = saved;
+      }
+    } catch (e) {
+      // Use default
+    }
+  }
+
+  async function saveSettings() {
+    try {
+      await sdk.settings.set("subscriptionTag", subscriptionTag);
+      sdk.toast.success("Settings saved");
+      showSettings = false;
+      // Reload with new tag
+      await detectSubscriptions();
+    } catch (e) {
+      sdk.toast.error("Failed to save settings", e instanceof Error ? e.message : String(e));
+    }
+  }
+
   async function loadHiddenMerchants() {
     try {
-      const rows = await sdk.query<HiddenSubscription>(
-        "SELECT merchant FROM sys_plugin_subscriptions WHERE hidden_at IS NOT NULL"
+      const rows = await sdk.query<any>(
+        "SELECT merchant_key FROM sys_plugin_subscriptions WHERE hidden_at IS NOT NULL"
       );
-      hiddenMerchants = new Set(rows.map(r => r.merchant));
+      // Query returns arrays, not objects - access by index
+      hiddenMerchantKeys = new Set(rows.map(r => r[0] as string).filter(Boolean));
     } catch (e) {
       // Table might not exist yet
     }
   }
 
   // Store the SQL for "View SQL" feature
-  const SUBSCRIPTION_SQL = `WITH merchant_transactions AS (
+  // Groups by amount + fuzzy description matching to handle merchant name variations
+  // (e.g., "Netflix.com Los Gatos CA" vs "NETFLIX.COM NETFLIX.COM CA")
+  const SUBSCRIPTION_SQL = `WITH base_transactions AS (
   SELECT
-    description as merchant,
+    ROUND(amount, 2) as norm_amount,
+    UPPER(description) as upper_desc,
+    description,
     amount,
-    transaction_date,
-    LAG(transaction_date) OVER (PARTITION BY description ORDER BY transaction_date) as prev_date
+    transaction_date
   FROM transactions
   WHERE amount < 0
     AND description IS NOT NULL
     AND description != ''
 ),
+-- For each amount, find the earliest description as the "canonical" one
+canonical_merchants AS (
+  SELECT DISTINCT ON (norm_amount)
+    norm_amount,
+    upper_desc as canonical_desc
+  FROM base_transactions
+  ORDER BY norm_amount, transaction_date ASC
+),
+-- Assign each transaction to a merchant group using fuzzy matching
+grouped_transactions AS (
+  SELECT
+    b.norm_amount,
+    b.description,
+    b.amount,
+    b.transaction_date,
+    -- Use canonical desc if fuzzy match > 0.7, otherwise use own description
+    CASE
+      WHEN jaro_winkler_similarity(b.upper_desc, c.canonical_desc) > 0.7
+      THEN c.canonical_desc
+      ELSE b.upper_desc
+    END as merchant_group
+  FROM base_transactions b
+  LEFT JOIN canonical_merchants c ON b.norm_amount = c.norm_amount
+),
+merchant_transactions AS (
+  SELECT
+    merchant_group,
+    norm_amount,
+    description as merchant,
+    amount,
+    transaction_date,
+    LAG(transaction_date) OVER (PARTITION BY merchant_group, norm_amount ORDER BY transaction_date) as prev_date
+  FROM grouped_transactions
+),
 merchant_intervals AS (
   SELECT
+    merchant_group,
+    norm_amount,
     merchant,
     amount,
     transaction_date,
@@ -159,31 +227,32 @@ merchant_intervals AS (
 ),
 ytd_spending AS (
   SELECT
-    description as merchant,
-    SUM(ABS(amount)) as ytd_total
-  FROM transactions
-  WHERE amount < 0
-    AND transaction_date >= DATE_TRUNC('year', CURRENT_DATE)
-  GROUP BY description
+    gt.merchant_group,
+    gt.norm_amount,
+    SUM(ABS(gt.amount)) as ytd_total
+  FROM grouped_transactions gt
+  WHERE gt.transaction_date >= DATE_TRUNC('year', CURRENT_DATE)
+  GROUP BY gt.merchant_group, gt.norm_amount
 ),
 merchant_stats AS (
   SELECT
-    mi.merchant,
+    FIRST(mi.merchant) as merchant,
+    mi.merchant_group as merchant_key,
     AVG(ABS(mi.amount)) as avg_amount,
     COUNT(*) + 1 as occurrence_count,
     AVG(mi.interval_days) as avg_interval,
     STDDEV(mi.interval_days) as stddev_interval,
     MAX(mi.transaction_date) as last_charge,
     MIN(mi.transaction_date) as first_charge,
-    COALESCE(ys.ytd_total, 0) as ytd_cost,
+    COALESCE(MAX(ys.ytd_total), 0) as ytd_cost,
     DATEDIFF('day', MAX(mi.transaction_date), CURRENT_DATE) as days_since_last
   FROM merchant_intervals mi
-  LEFT JOIN ytd_spending ys ON mi.merchant = ys.merchant
-  GROUP BY mi.merchant, ys.ytd_total
+  LEFT JOIN ytd_spending ys ON mi.merchant_group = ys.merchant_group AND mi.norm_amount = ys.norm_amount
+  GROUP BY mi.merchant_group, mi.norm_amount
   HAVING
     COUNT(*) >= 2
     AND AVG(mi.interval_days) BETWEEN 5 AND 400
-    AND STDDEV(mi.interval_days) < AVG(mi.interval_days) * 0.3
+    AND STDDEV(mi.interval_days) < AVG(mi.interval_days) * 0.5
 )
 SELECT * FROM merchant_stats
 ORDER BY avg_amount * (365.0 / avg_interval) DESC`;
@@ -191,17 +260,19 @@ ORDER BY avg_amount * (365.0 / avg_interval) DESC`;
   async function detectSubscriptions() {
     isLoading = true;
     try {
+      // Auto-detected subscriptions
       const rows = await sdk.query<any>(SUBSCRIPTION_SQL);
 
-      subscriptions = rows.map((row: any) => {
-        const merchant = row[0] as string;
-        const avg_amount = row[1] as number;
-        const occurrence_count = row[2] as number;
-        const avg_interval = row[3] as number;
-        const last_charge = row[5] as string;
-        const first_charge = row[6] as string;
-        const ytd_cost = row[7] as number;
-        const days_since_last = row[8] as number;
+      const autoDetected: Subscription[] = rows.map((row: any) => {
+        const merchant = row[0] as string || "";
+        const merchant_key = (row[1] as string) || merchant.toUpperCase();
+        const avg_amount = row[2] as number;
+        const occurrence_count = row[3] as number;
+        const avg_interval = row[4] as number;
+        const last_charge = row[6] as string;
+        const first_charge = row[7] as string;
+        const ytd_cost = row[8] as number;
+        const days_since_last = row[9] as number;
 
         const intervalDays = Math.round(avg_interval);
         let frequency = "unknown";
@@ -219,6 +290,7 @@ ORDER BY avg_amount * (365.0 / avg_interval) DESC`;
 
         return {
           merchant,
+          merchant_key,
           amount: Math.round(avg_amount * 100) / 100,
           frequency,
           interval_days: intervalDays,
@@ -229,8 +301,140 @@ ORDER BY avg_amount * (365.0 / avg_interval) DESC`;
           first_charge,
           days_since_last,
           is_stale,
+          is_manual: false,
         };
       });
+
+      // Tag-based manual subscriptions (if tag is set)
+      let manualSubs: Subscription[] = [];
+      const tagToUse = typeof subscriptionTag === "string" ? subscriptionTag.trim() : "";
+      if (tagToUse) {
+        const escapedTag = tagToUse.replace(/'/g, "''");
+        const taggedRows = await sdk.query<any>(`
+          WITH tagged_transactions AS (
+            SELECT
+              UPPER(description) as merchant_key,
+              description as merchant,
+              ABS(amount) as amount,
+              transaction_date,
+              LAG(transaction_date) OVER (PARTITION BY UPPER(description) ORDER BY transaction_date) as prev_date
+            FROM transactions
+            WHERE amount < 0
+              AND list_contains(tags, '${escapedTag}')
+          ),
+          with_intervals AS (
+            SELECT *,
+              DATEDIFF('day', prev_date, transaction_date) as interval_days
+            FROM tagged_transactions
+            WHERE prev_date IS NOT NULL
+          ),
+          grouped AS (
+            SELECT
+              merchant_key,
+              FIRST(merchant) as merchant,
+              AVG(amount) as avg_amount,
+              COUNT(*) + 1 as occurrence_count,
+              AVG(interval_days) as avg_interval,
+              MAX(transaction_date) as last_charge,
+              MIN(transaction_date) as first_charge,
+              DATEDIFF('day', MAX(transaction_date), CURRENT_DATE) as days_since_last
+            FROM with_intervals
+            GROUP BY merchant_key
+          ),
+          ytd AS (
+            SELECT
+              UPPER(description) as merchant_key,
+              SUM(ABS(amount)) as ytd_total
+            FROM transactions
+            WHERE amount < 0
+              AND list_contains(tags, '${escapedTag}')
+              AND transaction_date >= DATE_TRUNC('year', CURRENT_DATE)
+            GROUP BY UPPER(description)
+          )
+          SELECT
+            g.merchant,
+            g.merchant_key,
+            g.avg_amount,
+            g.occurrence_count,
+            COALESCE(g.avg_interval, 30) as avg_interval,
+            g.last_charge,
+            g.first_charge,
+            COALESCE(y.ytd_total, 0) as ytd_cost,
+            g.days_since_last
+          FROM grouped g
+          LEFT JOIN ytd y ON g.merchant_key = y.merchant_key
+          ORDER BY g.avg_amount DESC
+        `);
+
+        manualSubs = taggedRows.map((row: any) => {
+          const merchant = row[0] as string || "";
+          const merchant_key = (row[1] as string) || merchant.toUpperCase();
+          const avg_amount = row[2] as number;
+          const occurrence_count = row[3] as number;
+          const avg_interval = row[4] as number || 30;
+          const last_charge = row[5] as string;
+          const first_charge = row[6] as string;
+          const ytd_cost = row[7] as number;
+          const days_since_last = row[8] as number;
+
+          const intervalDays = Math.round(avg_interval);
+          let frequency = "unknown";
+
+          if (intervalDays <= 8) frequency = "weekly";
+          else if (intervalDays <= 16) frequency = "bi-weekly";
+          else if (intervalDays <= 35) frequency = "monthly";
+          else if (intervalDays <= 100) frequency = "quarterly";
+          else if (intervalDays <= 200) frequency = "semi-annual";
+          else frequency = "annual";
+
+          const staleThreshold = Math.max(intervalDays * 2, 90);
+          const is_stale = days_since_last > staleThreshold;
+
+          return {
+            merchant,
+            merchant_key,
+            amount: Math.round(avg_amount * 100) / 100,
+            frequency,
+            interval_days: intervalDays,
+            occurrence_count,
+            annual_cost: Math.round(avg_amount * (365 / intervalDays) * 100) / 100,
+            ytd_cost: Math.round(ytd_cost * 100) / 100,
+            last_charge,
+            first_charge,
+            days_since_last,
+            is_stale,
+            is_manual: true,
+          };
+        });
+      }
+
+      // Merge: auto-detected + manual
+      // Build sets of manual subscription identifiers for marking
+      const manualKeys = new Set(manualSubs.map(s => s.merchant_key));
+      const manualAmountFirstWord = new Set(manualSubs.map(s =>
+        `${s.amount.toFixed(2)}|${s.merchant.toUpperCase().split(' ')[0]}`
+      ));
+
+      // Mark auto-detected ones as "tagged" if they also appear in manual list
+      const markedAutoDetected = autoDetected.map(s => {
+        const amountFirstWord = `${s.amount.toFixed(2)}|${s.merchant.toUpperCase().split(' ')[0]}`;
+        const isAlsoManual = manualKeys.has(s.merchant_key) || manualAmountFirstWord.has(amountFirstWord);
+        return { ...s, is_manual: isAlsoManual };
+      });
+
+      // Filter manual subs to only those NOT in auto-detected
+      const autoKeys = new Set(autoDetected.map(s => s.merchant_key));
+      const autoAmountFirstWord = new Set(autoDetected.map(s =>
+        `${s.amount.toFixed(2)}|${s.merchant.toUpperCase().split(' ')[0]}`
+      ));
+      const uniqueManual = manualSubs.filter(s => {
+        if (autoKeys.has(s.merchant_key)) return false;
+        const amountFirstWord = `${s.amount.toFixed(2)}|${s.merchant.toUpperCase().split(' ')[0]}`;
+        if (autoAmountFirstWord.has(amountFirstWord)) return false;
+        return true;
+      });
+
+      subscriptions = [...markedAutoDetected, ...uniqueManual];
     } catch (e) {
       sdk.toast.error("Failed to detect subscriptions", e instanceof Error ? e.message : String(e));
     } finally {
@@ -239,29 +443,29 @@ ORDER BY avg_amount * (365.0 / avg_interval) DESC`;
   }
 
   // Actions
-  async function hideSubscription(merchant: string) {
+  async function hideSubscription(sub: Subscription) {
     try {
       await sdk.execute(`
-        INSERT INTO sys_plugin_subscriptions (merchant, hidden_at)
-        VALUES ('${merchant.replace(/'/g, "''")}', NOW())
-        ON CONFLICT (merchant) DO UPDATE SET hidden_at = NOW()
+        INSERT INTO sys_plugin_subscriptions (merchant_key, hidden_at)
+        VALUES ('${sub.merchant_key.replace(/'/g, "''")}', NOW())
+        ON CONFLICT (merchant_key) DO UPDATE SET hidden_at = NOW()
       `);
-      hiddenMerchants = new Set([...hiddenMerchants, merchant]);
-      sdk.toast.info("Hidden", `"${merchant}" marked as not a subscription`);
+      hiddenMerchantKeys = new Set([...hiddenMerchantKeys, sub.merchant_key]);
+      sdk.toast.info("Hidden", `"${sub.merchant}" marked as not a subscription`);
     } catch (e) {
       sdk.toast.error("Failed to hide", e instanceof Error ? e.message : String(e));
     }
   }
 
-  async function unhideSubscription(merchant: string) {
+  async function unhideSubscription(sub: Subscription) {
     try {
       await sdk.execute(`
-        DELETE FROM sys_plugin_subscriptions WHERE merchant = '${merchant.replace(/'/g, "''")}'
+        DELETE FROM sys_plugin_subscriptions WHERE merchant_key = '${sub.merchant_key.replace(/'/g, "''")}'
       `);
-      const newHidden = new Set(hiddenMerchants);
-      newHidden.delete(merchant);
-      hiddenMerchants = newHidden;
-      sdk.toast.info("Restored", `"${merchant}" is visible again`);
+      const newHidden = new Set(hiddenMerchantKeys);
+      newHidden.delete(sub.merchant_key);
+      hiddenMerchantKeys = newHidden;
+      sdk.toast.info("Restored", `"${sub.merchant}" is visible again`);
     } catch (e) {
       sdk.toast.error("Failed to restore", e instanceof Error ? e.message : String(e));
     }
@@ -360,10 +564,10 @@ ORDER BY transaction_date DESC`
       case "h":
         if (sub) {
           e.preventDefault();
-          if (hiddenMerchants.has(sub.merchant)) {
-            unhideSubscription(sub.merchant);
+          if (hiddenMerchantKeys.has(sub.merchant_key)) {
+            unhideSubscription(sub);
           } else {
-            hideSubscription(sub.merchant);
+            hideSubscription(sub);
           }
         }
         break;
@@ -415,6 +619,12 @@ ORDER BY transaction_date DESC`
         {/if}
       {/if}
       <div class="header-spacer"></div>
+      <button class="settings-btn" onclick={() => showSettings = true} title="Settings">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="12" r="3"/>
+          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+        </svg>
+      </button>
       <button class="refresh-btn" onclick={() => detectSubscriptions()} disabled={isLoading}>
         Refresh
       </button>
@@ -515,16 +725,20 @@ ORDER BY transaction_date DESC`
             </thead>
             <tbody>
               {#each sortedSubscriptions as sub, i}
-                {@const isHidden = hiddenMerchants.has(sub.merchant)}
+                {@const isHidden = hiddenMerchantKeys.has(sub.merchant_key)}
                 <tr
                   class:selected={i === cursorIndex}
                   class:hidden={isHidden}
                   class:stale={sub.is_stale && !isHidden}
+                  class:manual={sub.is_manual}
                   onclick={() => cursorIndex = i}
-                  ondblclick={() => viewTransactions(sub.merchant)}
+                  ondblclick={() => viewTransactionsInQuery(sub.merchant)}
                 >
                   <td class="col-merchant">
                     <span class="merchant-name">{sub.merchant}</span>
+                    {#if sub.is_manual}
+                      <span class="manual-indicator" title="Manually tagged with '{subscriptionTag}'">Tagged</span>
+                    {/if}
                     {#if sub.is_stale && !isHidden}
                       <span class="stale-indicator" title="No charge in {sub.days_since_last} days">Inactive?</span>
                     {/if}
@@ -544,7 +758,7 @@ ORDER BY transaction_date DESC`
         <aside class="sidebar">
           {#if selectedSubscription}
             {@const sub = selectedSubscription}
-            {@const isHidden = hiddenMerchants.has(sub.merchant)}
+            {@const isHidden = hiddenMerchantKeys.has(sub.merchant_key)}
             <div class="sidebar-section">
               <h3 class="sidebar-title">Selected</h3>
               <div class="detail-card">
@@ -616,11 +830,11 @@ ORDER BY transaction_date DESC`
 
             <div class="sidebar-section sidebar-actions">
               {#if isHidden}
-                <button class="action-btn" onclick={() => unhideSubscription(sub.merchant)}>
+                <button class="action-btn" onclick={() => unhideSubscription(sub)}>
                   Restore
                 </button>
               {:else}
-                <button class="action-btn" onclick={() => hideSubscription(sub.merchant)}>
+                <button class="action-btn" onclick={() => hideSubscription(sub)}>
                   Hide (Not a Subscription)
                 </button>
               {/if}
@@ -655,6 +869,46 @@ ORDER BY transaction_date DESC`
     <span class="hint"><kbd>/</kbd> search</span>
   </footer>
 </div>
+
+<!-- Settings Modal -->
+{#if showSettings}
+  <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+  <div class="modal-backdrop" onclick={() => showSettings = false}>
+    <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+    <div class="modal" onclick={(e) => e.stopPropagation()}>
+      <h3>Subscriptions Settings</h3>
+
+      <div class="settings-section">
+        <label class="setting-label">
+          <span class="setting-title">Manual Subscription Tag</span>
+          <span class="setting-desc">
+            Transactions tagged with this tag will be included as subscriptions, even if not auto-detected.
+            This is useful for irregular subscriptions or services that don't have consistent billing patterns.
+          </span>
+          <input
+            type="text"
+            class="setting-input"
+            bind:value={subscriptionTag}
+            placeholder="subscriptions"
+          />
+        </label>
+        <p class="setting-hint">
+          To manually add a subscription: Tag any transaction with "{subscriptionTag}" in the main Transactions view.
+          Once you have 2+ charges with the same description and this tag, it will appear here.
+        </p>
+      </div>
+
+      <div class="modal-actions">
+        <button class="btn secondary" onclick={() => showSettings = false}>
+          Cancel
+        </button>
+        <button class="btn primary" onclick={saveSettings}>
+          Save
+        </button>
+      </div>
+    </div>
+  </div>
+{/if}
 
 <style>
   .subscriptions-view {
@@ -1314,5 +1568,153 @@ ORDER BY transaction_date DESC`
     border-radius: 3px;
     font-family: var(--font-mono, monospace);
     font-size: 10px;
+  }
+
+  /* Settings button */
+  .settings-btn {
+    background: none;
+    border: 1px solid var(--border-primary);
+    border-radius: 4px;
+    padding: 6px 8px;
+    cursor: pointer;
+    color: var(--text-secondary);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.15s;
+  }
+
+  .settings-btn:hover {
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+  }
+
+  /* Manual subscription indicator */
+  .manual-indicator {
+    display: inline-block;
+    margin-left: 8px;
+    padding: 2px 6px;
+    background: var(--accent-primary);
+    color: white;
+    border-radius: 3px;
+    font-size: 9px;
+    font-weight: 600;
+    text-transform: uppercase;
+    opacity: 0.8;
+  }
+
+  .table tbody tr.manual {
+    background: rgba(59, 130, 246, 0.05);
+  }
+
+  /* Settings Modal */
+  .modal-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.5);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+  }
+
+  .modal {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-primary);
+    border-radius: 8px;
+    padding: var(--spacing-lg, 16px);
+    width: 450px;
+    max-width: 95vw;
+    max-height: 85vh;
+    overflow-y: auto;
+  }
+
+  .modal h3 {
+    margin: 0 0 var(--spacing-md, 12px) 0;
+    font-size: 16px;
+    font-weight: 600;
+  }
+
+  .settings-section {
+    margin-bottom: var(--spacing-md, 12px);
+  }
+
+  .setting-label {
+    display: flex;
+    flex-direction: column;
+    gap: var(--spacing-xs, 4px);
+  }
+
+  .setting-title {
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-primary);
+  }
+
+  .setting-desc {
+    font-size: 11px;
+    color: var(--text-muted);
+    line-height: 1.4;
+    margin-bottom: var(--spacing-sm, 8px);
+  }
+
+  .setting-input {
+    padding: 8px;
+    background: var(--bg-primary);
+    border: 1px solid var(--border-primary);
+    border-radius: 4px;
+    color: var(--text-primary);
+    font-size: 13px;
+  }
+
+  .setting-input:focus {
+    outline: none;
+    border-color: var(--accent-primary);
+  }
+
+  .setting-hint {
+    font-size: 11px;
+    color: var(--text-muted);
+    background: var(--bg-tertiary);
+    padding: var(--spacing-sm, 8px);
+    border-radius: 4px;
+    margin-top: var(--spacing-sm, 8px);
+    line-height: 1.4;
+  }
+
+  .modal-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: var(--spacing-sm, 8px);
+    margin-top: var(--spacing-lg, 16px);
+  }
+
+  .btn {
+    padding: 8px 16px;
+    border-radius: 4px;
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    border: none;
+    transition: all 0.15s ease;
+  }
+
+  .btn.primary {
+    background: var(--accent-primary);
+    color: white;
+  }
+
+  .btn.primary:hover {
+    opacity: 0.9;
+  }
+
+  .btn.secondary {
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-primary);
+    color: var(--text-primary);
+  }
+
+  .btn.secondary:hover {
+    background: var(--bg-primary);
   }
 </style>
