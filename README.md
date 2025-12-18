@@ -2,11 +2,22 @@
 
 A [Treeline](https://github.com/zack-schrag/treeline-money) plugin that detects recurring charges and tracks subscription costs.
 
-Features:
-- Automatic detection of recurring charges
-- Monthly/yearly cost breakdown
-- Hide subscriptions you don't want to track
-- See when subscriptions will next charge
+## Features
+
+- **Auto-detection**: Analyzes transaction patterns using fuzzy matching to find recurring charges
+- **Cost tracking**: See monthly, annual, and year-to-date spending on subscriptions
+- **Hide false positives**: Mark non-subscriptions to exclude them from totals
+- **Manual tagging**: Tag transactions to force-include subscriptions that aren't auto-detected
+- **Stale detection**: Highlights subscriptions that may have been cancelled (no recent charges)
+- **Recent charges**: Preview recent transactions for any subscription
+- **View SQL**: See the detection query for power users
+
+## Keyboard Shortcuts
+
+- `j` / `k` - Navigate up/down
+- `Enter` - View transactions in Query Editor
+- `h` - Hide/restore subscription
+- `/` - Focus search
 
 ## Installation
 
