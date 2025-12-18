@@ -21,7 +21,7 @@ export const plugin: Plugin = {
     context.registerView({
       id: "subscriptions",
       name: "Subscriptions",
-      icon: "🔄",
+      icon: "repeat",
       mount: (target: HTMLElement, props: Record<string, any>) => {
         const instance = mount(SubscriptionsView, {
           target,
@@ -39,7 +39,7 @@ export const plugin: Plugin = {
       sectionId: "main",
       id: "subscriptions",
       label: "Subscriptions",
-      icon: "🔄",
+      icon: "repeat",
       viewId: "subscriptions",
     });
 
