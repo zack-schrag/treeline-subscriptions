@@ -1,16 +1,15 @@
 {
   "id": "subscriptions",
   "name": "Subscriptions",
-  "version": "0.1.10",
+  "version": "0.2.0",
   "description": "Detect recurring charges and track subscription costs",
   "author": "Treeline",
   "icon": "repeat",
   "main": "index.js",
   "permissions": {
     "tables": {
-      "write": [
-        "sys_plugin_subscriptions"
-      ]
+      "read": ["transactions", "sys_plugin_subscriptions"],
+      "create": ["sys_plugin_subscriptions"]
     }
   }
 }
